@@ -1,0 +1,136 @@
+{
+  "generated_at": "2026-08-14T10:15:47.435731+00:00",
+  "fx_rates_to_sgd": {
+    "SGD": 1,
+    "USD": 1.2787,
+    "HKD": 0.1629,
+    "CNY": 0.1891
+  },
+  "prices": {
+    "0857.HK": {
+      "name": "PetroChina H",
+      "exchange": "HKEX",
+      "category": null,
+      "price": 9.455,
+      "currency": "HKD",
+      "prev_close": null,
+      "day_change_pct": null
+    },
+    "MSFT": {
+      "name": "Microsoft",
+      "exchange": "NASDAQ",
+      "category": null,
+      "price": 496.88,
+      "currency": "USD",
+      "prev_close": null,
+      "day_change_pct": null
+    },
+    "META": {
+      "name": "Meta Platforms",
+      "exchange": "NASDAQ",
+      "category": null,
+      "price": 594.97,
+      "currency": "USD",
+      "prev_close": null,
+      "day_change_pct": null
+    },
+    "HXXD.SI": {
+      "name": "Xiaomi (SGX Depositary Receipt)",
+      "exchange": "SGX",
+      "category": null,
+      "price": 2.18,
+      "currency": "SGD",
+      "prev_close": null,
+      "day_change_pct": null
+    },
+    "300750.SZ": {
+      "name": "Amperex Tech / CATL (A-share)",
+      "exchange": "Shenzhen",
+      "category": null,
+      "price": 393.93,
+      "currency": "CNY",
+      "prev_close": null,
+      "day_change_pct": null
+    },
+    "SE": {
+      "name": "Sea Limited",
+      "exchange": "NYSE",
+      "category": null,
+      "price": 123.32,
+      "currency": "USD",
+      "prev_close": null,
+      "day_change_pct": null
+    },
+    "HBBD.SI": {
+      "name": "Alibaba (SGX Depositary Receipt)",
+      "exchange": "SGX",
+      "category": null,
+      "price": 3.93,
+      "currency": "SGD",
+      "prev_close": null,
+      "day_change_pct": null
+    },
+    "O39.SI": {
+      "name": "OCBC Bank",
+      "exchange": "SGX",
+      "category": null,
+      "price": 31.79,
+      "currency": "SGD",
+      "prev_close": null,
+      "day_change_pct": null
+    },
+    "N2IU.SI": {
+      "name": "Mapletree Pan Asia Commercial Trust",
+      "exchange": "SGX",
+      "category": null,
+      "price": 1.28,
+      "currency": "SGD",
+      "prev_close": null,
+      "day_change_pct": null
+    },
+    "C38U.SI": {
+      "name": "CapitaLand Integrated Commercial Trust",
+      "exchange": "SGX",
+      "category": null,
+      "price": 2.43,
+      "currency": "SGD",
+      "prev_close": null,
+      "day_change_pct": null
+    },
+    "GOOGL": {
+      "name": "Alphabet A",
+      "exchange": "NASDAQ",
+      "category": null,
+      "price": 346.36,
+      "currency": "USD",
+      "prev_close": null,
+      "day_change_pct": null
+    },
+    "AAPL": {
+      "name": "Apple",
+      "exchange": "NASDAQ",
+      "category": null,
+      "price": 305.26,
+      "currency": "USD",
+      "prev_close": null,
+      "day_change_pct": null
+    },
+    "NVDA": {
+      "name": "NVIDIA",
+      "exchange": "NASDAQ",
+      "category": null,
+      "price": 225.3,
+      "currency": "USD",
+      "prev_close": null,
+      "day_change_pct": null
+    }
+  },
+  "history": {
+    "1W": null,
+    "1M": null,
+    "6M": null,
+    "1Y": null,
+    "All": null
+  },
+  "failed_tickers": []
+}
