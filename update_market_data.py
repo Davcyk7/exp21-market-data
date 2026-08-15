@@ -47,6 +47,14 @@ FX_TICKERS = {
     # SGD needs no conversion
 }
 
+# World-index ticker for the app's "against a benchmark" comparison on
+# Insights. Fetched alongside your actual holdings on the exact same date
+# axis per range, so the app can show a real "you vs. the world index"
+# return comparison — not a holding, so it's deliberately kept out of
+# TICKERS/prices (it won't show up in your allocation or holdings list),
+# only its historical series is used.
+BENCHMARK_TICKER = "VT"  # Vanguard Total World Stock ETF
+
 # Historical ranges the app's range buttons (1W/1M/6M/1Y/All) switch between.
 # Daily-or-coarser resolution only — not intraday — kept deliberately simple
 # so it works reliably across US/HK/SG/China trading calendars in one script.
@@ -163,10 +171,11 @@ def main():
             print(f"  {ticker:<11} FAILED  {e}")
 
     print("\nFetching historical series (this takes longer)...")
+    history_tickers = list(TICKERS.keys()) + [BENCHMARK_TICKER]
     history = {}
     for range_key, cfg in RANGES.items():
         print(f"  {range_key} ({cfg['period']} / {cfg['interval']})...")
-        history[range_key] = build_range_history(TICKERS.keys(), cfg["period"], cfg["interval"])
+        history[range_key] = build_range_history(history_tickers, cfg["period"], cfg["interval"])
 
     output = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
