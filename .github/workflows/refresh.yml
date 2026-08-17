@@ -2,9 +2,20 @@ name: Refresh market data
 
 on:
   schedule:
-    # Every 30 minutes. GitHub Actions cron is always UTC, and times can
-    # drift a few minutes under load — that's fine for this purpose.
-    - cron: '*/30 * * * *'
+    # Every 30 minutes, offset from the hour/half-hour (was '*/30 * * * *').
+    # GitHub's own docs say scheduled runs can be delayed or dropped under
+    # load, "especially at the start of every hour" — exactly the round
+    # minute marks the old schedule fired on. Confirmed happening for real
+    # on 2026-08-17: market_data.json's own generated_at sat frozen for
+    # ~2h53m (from Mon 07:42 SGT through mid-morning) while the Actions
+    # page still showed runs "succeeding" — the workflow just wasn't being
+    # triggered at all during that stretch. Firing 6 and 36 minutes past
+    # the hour instead avoids the busiest scheduling window and should
+    # cut how often this happens — GitHub gives no guarantee it reaches
+    # zero on the free tier, so the app itself now also warns David
+    # directly (via generated_at) if this file goes stale again, rather
+    # than silently showing "Live" with hours-old prices.
+    - cron: '6,36 * * * *'
   # Lets you trigger it by hand from the Actions tab, e.g. to test it once
   # right after setting this up, without waiting for the schedule.
   workflow_dispatch: {}
