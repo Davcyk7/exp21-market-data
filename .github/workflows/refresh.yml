@@ -2,22 +2,27 @@ name: Refresh market data
 
 on:
   schedule:
-    # Every 30 minutes, offset from the hour/half-hour (was '*/30 * * * *').
-    # GitHub's own docs say scheduled runs can be delayed or dropped under
-    # load, "especially at the start of every hour" — exactly the round
-    # minute marks the old schedule fired on. Confirmed happening for real
-    # on 2026-08-17: market_data.json's own generated_at sat frozen for
-    # ~2h53m (from Mon 07:42 SGT through mid-morning) while the Actions
-    # page still showed runs "succeeding" — the workflow just wasn't being
-    # triggered at all during that stretch. Firing 6 and 36 minutes past
-    # the hour instead avoids the busiest scheduling window and should
-    # cut how often this happens — GitHub gives no guarantee it reaches
-    # zero on the free tier, so the app itself now also warns David
-    # directly (via generated_at) if this file goes stale again, rather
-    # than silently showing "Live" with hours-old prices.
-    - cron: '6,36 * * * *'
+    # v40: tightened from every 30 minutes to every 15 — GitHub's own docs
+    # say scheduled runs can be delayed or dropped under load, "especially
+    # at the start of every hour," and the 30-min offset schedule below
+    # (6/36 past the hour) has now gone quiet for real TWICE: ~2h53m on
+    # 2026-08-17, and ~1h45m again just before this change. Firing twice
+    # as often doesn't make any single run more likely to fire, but it
+    # roughly doubles how many independent chances there are within any
+    # given hour, meaningfully shrinking the odds of a long gap. This is
+    # deliberately paired with a second, independent fix: a Cloudflare
+    # Worker Cron Trigger (see cloudflare-worker/worker.js's
+    # triggerMarketDataRefresh in the main Vestly repo) now force-runs
+    # this exact workflow every 15 minutes too, on a completely different
+    # scheduler — that's the real reliability backstop; this tighter
+    # native schedule is cheap, easy defense-in-depth on top of it, not a
+    # guarantee on its own. Still offset from the round quarter-hour marks
+    # (GitHub's busiest scheduling window), same reasoning as before.
+    - cron: '6,21,36,51 * * * *'
   # Lets you trigger it by hand from the Actions tab, e.g. to test it once
-  # right after setting this up, without waiting for the schedule.
+  # right after setting this up, without waiting for the schedule. Also
+  # what the Cloudflare Worker above calls via the REST API, on its own
+  # independent 15-min schedule.
   workflow_dispatch: {}
 
 # Needed so this workflow can commit the updated market_data.json back into
