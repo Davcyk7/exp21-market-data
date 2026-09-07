@@ -19,7 +19,19 @@ on:
   # right after setting this up, without waiting for the schedule. Also
   # what the Cloudflare Worker above calls via the REST API, on its own
   # independent hourly schedule.
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      backfill_days:
+        description: >-
+          Leave blank for a normal run. Only fill this in to rebuild 6M/1Y/All
+          history quickly after it's been reset (e.g. market_data.json got
+          overwritten by mistake) — enter how many days back to fetch in this
+          ONE run, e.g. 1900. See update_market_data.py's BACKFILL_DAYS
+          comment for the full reasoning. Costs a bit more of the monthly
+          Marketstack quota than a normal run — still cheap, just don't run
+          it repeatedly.
+        required: false
+        default: ''
 
 # Needed so this workflow can commit the updated market_data.json back into
 # the repo using the built-in token — no extra secrets or personal access
@@ -49,6 +61,11 @@ jobs:
           # repo. Without it, update_market_data.py exits immediately
           # without touching market_data.json (see its own docstring).
           MARKETSTACK_API_KEY: ${{ secrets.MARKETSTACK_API_KEY }}
+          # v44: only set when you fill in "backfill_days" running this by
+          # hand from the Actions tab — blank on every normal scheduled run,
+          # which is exactly what leaves the script's own default (7 days)
+          # in place. See update_market_data.py's own BACKFILL_DAYS comment.
+          BACKFILL_DAYS: ${{ github.event.inputs.backfill_days }}
 
       - name: Commit updated market_data.json
         run: |
