@@ -187,6 +187,8 @@ def http_get_json(url, timeout=30, retries=2):
 # Marketstack
 # --------------------------------------------------------------------- #
 
+MARKETSTACK_PAGE_LIMIT = 1000
+
 def marketstack_eod(symbols, date_from, date_to, api_key):
     """One (usually) request across every symbol at once, via Marketstack's
     comma-separated `symbols` param. Paginates defensively if the account's
@@ -194,7 +196,23 @@ def marketstack_eod(symbols, date_from, date_to, api_key):
     FETCH_WINDOW_DAYS' own comment for why that's not expected to happen in
     normal operation. Returns a flat list of {symbol, date, close} dicts
     (dividend/split_factor are also present on each row but deliberately
-    unused here — see the module docstring's point 2)."""
+    unused here — see the module docstring's point 2).
+
+    v44 bug fix, confirmed LIVE: this used to stop paginating once
+    `offset >= pagination.total`. Confirmed directly against the real API
+    (a single symbol, full 5-year window, `limit=1000`) that `total` comes
+    back as EXACTLY `count`/`limit` — 1000 — once the true match count
+    exceeds one page, not the real total row count. Trusting it silently
+    truncated a BACKFILL_DAYS run to ~1000 rows total (≈6 months across 8
+    symbols) even though real, older data genuinely exists (confirmed via
+    a separate live request for January 2023 alone). Now paginates purely
+    on page SHAPE instead: keep requesting the next page as long as the
+    previous one came back FULL (exactly MARKETSTACK_PAGE_LIMIT rows) —
+    a page shorter than that (including empty) is the only reliable
+    "nothing more to fetch" signal, regardless of what `pagination.total`
+    claims. Harmless for a normal 7-day run (~56 rows, always page 1 of
+    1) — this only changes behavior once a query's true results exceed a
+    single page, which BACKFILL_DAYS is the one thing that does."""
     if not symbols:
         return []
     rows = []
@@ -206,7 +224,7 @@ def marketstack_eod(symbols, date_from, date_to, api_key):
             "symbols": ",".join(symbols),
             "date_from": date_from,
             "date_to": date_to,
-            "limit": 1000,
+            "limit": MARKETSTACK_PAGE_LIMIT,
             "offset": offset,
         }
         url = f"{MARKETSTACK_BASE}/eod?{urllib.parse.urlencode(params)}"
@@ -217,11 +235,8 @@ def marketstack_eod(symbols, date_from, date_to, api_key):
         data = payload.get("data", [])
         rows.extend(data)
         seen_pages += 1
-        pagination = payload.get("pagination", {})
-        total = pagination.get("total", len(rows))
-        count = pagination.get("count", len(data))
-        offset += count if count else len(data)
-        if not data or offset >= total or seen_pages > 50:  # 50 is a hard safety cap, not an expected case
+        offset += len(data)
+        if len(data) < MARKETSTACK_PAGE_LIMIT or seen_pages > 50:  # short/empty page = real end; 50 is a hard safety cap, not an expected case
             break
     return rows
 
