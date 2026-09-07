@@ -76,23 +76,45 @@ OUT_PATH = "market_data.json"
 #      Finance" research). A None entry is skipped entirely by the fetch
 #      (costs nothing) and left out of `prices`/`history` in the output,
 #      same as any other ticker the cloud script doesn't cover — the app's
-#      own on-demand live-fetch fallback is what a real fix for these two
-#      needs (swapping to their primary HKEX listings — a separate,
-#      deliberately-not-automatic change, since it also changes what
-#      currency/DR-ratio the position is priced in; see the main repo's
-#      README once that lands).
+#      own on-demand live-fetch fallback would normally be the fix, EXCEPT
+#      it goes through the exact same Marketstack account and hits the
+#      exact same gap below, so for a HKEX/SGX-restricted ticker there's
+#      currently no working fallback at all — see that comment for what
+#      would actually fix it.
+#
+# CONFIRMED 2026-09-07, live, on the real paid Basic plan: Hong Kong
+# (XHKG) and Singapore (XSES) exchange EOD data returns completely empty
+# — zero rows over date ranges up to a full month — for tickers Marketstack's
+# OWN ticker-search index lists with "has_eod": true (e.g. "0857.XHKG" for
+# PetroChina). Shenzhen (XSHE) and every US ticker fetch fine on this same
+# plan/key. NOT a plan-tier restriction (that was the first, wrong guess) —
+# a follow-up check on /v1/eod/latest (no date filter) found one real row
+# dated 2023-10-09, and a 2023-01 date window returned full real OHLCV, so
+# the feed WAS live through early/mid 2023 and then froze completely. Cross-
+# referenced against Marketstack's own (archived June 2024) GitHub issue
+# tracker: multiple OTHER non-US exchanges — London, Sweden, Denmark — show
+# the exact same "no data since ~Oct 2023" pattern in still-open issues.
+# Reads as a broader, apparently permanent Marketstack pipeline failure
+# across several non-US exchanges, not something fixable client-side, and
+# not likely to be fixed by support (repo archived, issues unresolved 2+
+# years). Treated as a standing limitation (see the main repo's README
+# "Marketstack quota budget" section for the full writeup and how this
+# changes the actual coverage count from the original 11-of-13 estimate).
+# marketstack: None below for these four is what that decision looks like
+# in code — same treatment as the two SGX depositary receipts, which were
+# already known to be missing entirely.
 # name/exchange/category: display metadata only, shown in the app.
 TICKERS = {
-    "0857.HK":   {"marketstack": "0857.XHKG",   "name": "PetroChina H",                          "exchange": "HKEX",     "category": "Equities", "currency": "HKD"},
+    "0857.HK":   {"marketstack": None,           "name": "PetroChina H",                          "exchange": "HKEX",     "category": "Equities", "currency": "HKD"},
     "MSFT":      {"marketstack": "MSFT",         "name": "Microsoft",                             "exchange": "NASDAQ",   "category": "Equities", "currency": "USD"},
     "META":      {"marketstack": "META",         "name": "Meta Platforms",                        "exchange": "NASDAQ",   "category": "Equities", "currency": "USD"},
     "HXXD.SI":   {"marketstack": None,           "name": "Xiaomi (SGX Depositary Receipt)",       "exchange": "SGX",      "category": "Equities", "currency": "SGD"},
     "300750.SZ": {"marketstack": "300750.XSHE",  "name": "Amperex Tech / CATL (A-share)",         "exchange": "Shenzhen", "category": "Equities", "currency": "CNY"},
     "SE":        {"marketstack": "SE",           "name": "Sea Limited",                           "exchange": "NYSE",     "category": "Equities", "currency": "USD"},
     "HBBD.SI":   {"marketstack": None,           "name": "Alibaba (SGX Depositary Receipt)",      "exchange": "SGX",      "category": "Equities", "currency": "SGD"},
-    "O39.SI":    {"marketstack": "O39.XSES",     "name": "OCBC Bank",                             "exchange": "SGX",      "category": "Equities", "currency": "SGD"},
-    "N2IU.SI":   {"marketstack": "N2IU.XSES",    "name": "Mapletree Pan Asia Commercial Trust",   "exchange": "SGX",      "category": "REITs",    "currency": "SGD"},
-    "C38U.SI":   {"marketstack": "C38U.XSES",    "name": "CapitaLand Integrated Commercial Trust","exchange": "SGX",      "category": "REITs",    "currency": "SGD"},
+    "O39.SI":    {"marketstack": None,           "name": "OCBC Bank",                             "exchange": "SGX",      "category": "Equities", "currency": "SGD"},
+    "N2IU.SI":   {"marketstack": None,           "name": "Mapletree Pan Asia Commercial Trust",   "exchange": "SGX",      "category": "REITs",    "currency": "SGD"},
+    "C38U.SI":   {"marketstack": None,           "name": "CapitaLand Integrated Commercial Trust","exchange": "SGX",      "category": "REITs",    "currency": "SGD"},
     "GOOGL":     {"marketstack": "GOOGL",        "name": "Alphabet A",                            "exchange": "NASDAQ",   "category": "Equities", "currency": "USD"},
     "AAPL":      {"marketstack": "AAPL",         "name": "Apple",                                 "exchange": "NASDAQ",   "category": "Equities", "currency": "USD"},
     "NVDA":      {"marketstack": "NVDA",         "name": "NVIDIA",                                "exchange": "NASDAQ",   "category": "Equities", "currency": "USD"},
@@ -120,7 +142,9 @@ FX_CURRENCIES = sorted({t["currency"] for t in TICKERS.values()} - {BASE_CURRENC
 # keeping each run's request comfortably inside a single Marketstack page
 # even at the smallest page size this project has ever observed live
 # (100 rows — see the main repo's "Marketstack quota budget" section):
-# ~12 symbols x 7 days = ~84 rows, well under 100. If Marketstack ever
+# ~8 symbols x 7 days = ~56 rows (7 real holdings Marketstack actually
+# covers, plus VT — see TICKERS' own comment on the 6 that don't), well
+# under 100. If Marketstack ever
 # returns more rows than one page for this window, `marketstack_eod`
 # below still paginates correctly — it just costs more than 1 request
 # that run, not a hard failure.
@@ -392,6 +416,27 @@ def build_range(range_key, cfg, prior_history, fresh_prices_daily, fresh_fx_dail
 # main
 # --------------------------------------------------------------------- #
 
+def resolve_fetch_window_days(backfill_raw, default_days=FETCH_WINDOW_DAYS):
+    """Pure. `backfill_raw` is the raw BACKFILL_DAYS env value (a string,
+    possibly empty/None) — see main()'s own BACKFILL_DAYS comment for why
+    this exists. Returns (days_to_use, message_or_None): the normal
+    `default_days` unless `backfill_raw` is a whole number strictly greater
+    than it, in which case that larger number wins. A blank/missing value,
+    a non-numeric value, or a value that isn't actually larger than the
+    default all fall back to `default_days` — the last two log an
+    explanatory message so a typo'd input doesn't silently do nothing."""
+    raw = (backfill_raw or "").strip()
+    if not raw:
+        return default_days, None
+    try:
+        backfill_days = int(raw)
+    except ValueError:
+        return default_days, f"BACKFILL_DAYS={raw!r} isn't a whole number — ignoring it, using the normal {default_days}-day window."
+    if backfill_days > default_days:
+        return backfill_days, f"BACKFILL_DAYS={backfill_days} set — this run fetches {backfill_days} days instead of the normal {default_days}."
+    return default_days, f"BACKFILL_DAYS={raw} is not larger than the normal {default_days}-day window — ignoring it."
+
+
 def main():
     api_key = os.environ.get("MARKETSTACK_API_KEY")
     if not api_key:
@@ -406,15 +451,40 @@ def main():
     prior_history = previous.get("history") or {}
     prior_prices = previous.get("prices") or {}
 
+    # v44: one-time (or occasional) backfill escape hatch. Normal runs fetch
+    # only FETCH_WINDOW_DAYS (7) and lean on merge_and_window to build up
+    # 6M/1Y/All history incrementally, a bit more each run — by design, see
+    # this file's own module docstring. That's the right steady-state
+    # behaviour, but it has a real cold-start cost: if prior_history is ever
+    # lost (an empty/corrupted market_data.json committed by mistake, or the
+    # very first run after this script was introduced), 6M/1Y/All start
+    # from near-nothing and would otherwise take WEEKS (weekly buckets) to
+    # MONTHS (monthly buckets) to refill on their own, even though
+    # Marketstack itself has years of real history available right now (see
+    # this file's own docstring point 2, and the main repo's README, on
+    # Marketstack's actual "10 Years History" coverage on the Basic plan).
+    # Setting the BACKFILL_DAYS env var (via this repo's Actions tab -> "Run
+    # workflow" -> backfill_days input, see refresh.yml) fetches that many
+    # days in ONE run instead of the usual 7, letting build_range's normal
+    # bucketing/windowing immediately populate 6M/1Y/All for real, rather
+    # than waiting on the slow incremental path. Costs more of the monthly
+    # Marketstack quota than a normal run (still cheap — ~8 symbols x 1900
+    # days is roughly a dozen paginated /eod requests, not a dozen PER
+    # symbol; see marketstack_eod's own pagination), and is meant to be used
+    # rarely, not every run — leave the input blank for the normal schedule.
+    fetch_window_days, backfill_msg = resolve_fetch_window_days(os.environ.get("BACKFILL_DAYS"))
+    if backfill_msg:
+        print(backfill_msg)
+
     today = datetime.now(timezone.utc).date()
-    date_from = (today - timedelta(days=FETCH_WINDOW_DAYS)).isoformat()
+    date_from = (today - timedelta(days=fetch_window_days)).isoformat()
     date_to = today.isoformat()
 
     ms_symbol_to_ticker = {info["marketstack"]: ticker for ticker, info in TICKERS.items() if info["marketstack"]}
     ms_symbol_to_ticker[BENCHMARK_MARKETSTACK] = BENCHMARK_TICKER
     symbols = list(ms_symbol_to_ticker.keys())
 
-    print(f"Fetching {len(symbols)} symbols' last {FETCH_WINDOW_DAYS} days from Marketstack ({date_from}..{date_to})...")
+    print(f"Fetching {len(symbols)} symbols' last {fetch_window_days} days from Marketstack ({date_from}..{date_to})...")
     failed = []
     fresh_by_symbol = {}
     try:
