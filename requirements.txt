@@ -1,2 +1,5 @@
-yfinance
-pandas
+# v43: update_market_data.py now uses only Python's own standard library
+# (urllib, json) — no yfinance, no pandas. Left as a comment-only file
+# rather than deleted so refresh.yml's `pip install -r requirements.txt`
+# step keeps working unchanged (an empty/comment-only requirements file is
+# valid and installs nothing).
