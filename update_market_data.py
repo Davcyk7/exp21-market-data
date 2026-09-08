@@ -133,7 +133,24 @@ BENCHMARK_MARKETSTACK = "VT"
 # every range's `fx` array below, matching what App.js's fxConvert/
 # buildValueSeries already expect.
 BASE_CURRENCY = "SGD"
-FX_CURRENCIES = sorted({t["currency"] for t in TICKERS.values()} - {BASE_CURRENCY})
+
+# v44 follow-up (David-requested, after the "let's test UK, Japan and
+# Frankfurt" live spot-check confirmed Frankfurt/XETRA/Toronto/Amsterdam/
+# Brazil all return real Marketstack price data): GBP/EUR/CAD/BRL are
+# fetched UNCONDITIONALLY here, not just derived from TICKERS below. TICKERS
+# is David's own fixed, manually-curated list — deriving FX_CURRENCIES from
+# it alone would mean these four currencies only start getting real rates
+# the day David's own TICKERS table happens to include one, which does
+# nothing for any position — David's or any future user's — added through
+# the app's own on-demand Add Position flow (a completely separate code
+# path from this cloud script, see App.js's CURRENCIES comment). Widening
+# App.js's CURRENCIES to actually USE these rates is a paired change — see
+# that file's own CURRENCIES/CURRENCY_SYMBOLS comments; this file alone
+# only supplies the rate, App.js decides who's allowed to auto-lock to it.
+ALWAYS_FETCHED_FX_CURRENCIES = {"GBP", "EUR", "CAD", "BRL"}
+FX_CURRENCIES = sorted(
+    ({t["currency"] for t in TICKERS.values()} | ALWAYS_FETCHED_FX_CURRENCIES) - {BASE_CURRENCY}
+)
 
 # How many trailing calendar days of DAILY bars to fetch fresh, every run.
 # This is deliberately small — see the module docstring's point 2. 7 days
