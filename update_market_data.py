@@ -4,129 +4,103 @@ plus FX rates, and write one JSON file: market_data.json, committed straight
 into this same repo by the GitHub Actions workflow in
 .github/workflows/refresh.yml.
 
-v43 (leaving Yahoo Finance): this REPLACES the yfinance/pandas version of
-this script. Same output shape (the app itself, App.js, doesn't change at
-all because of this) — what changed is where the numbers come from and how
-often this runs. Two things forced this rewrite together, not separately:
+v46 (David's personal-use pivot, back to Yahoo Finance, 2026-09-30): this
+REPLACES the Marketstack version of this script (itself a v43 rewrite of
+the original yfinance/pandas version). David decided to stop monetizing
+Vestly and use it personally only — the exact ToS risk that forced v42's
+move off Yahoo (Yahoo's terms restrict commercial/automated use) no longer
+applies to a personal-use app, so this reverts to Yahoo Finance via the
+`yfinance` package. Same output shape as always (App.js doesn't change at
+all because of this) — what changed is where the numbers come from and,
+because yfinance has no metered quota to protect, a real simplification of
+HOW this script fetches them:
 
-  1. Yahoo Finance's endpoint was never a real, licensed data source (see
-     the main Vestly repo's "Leaving Yahoo Finance" README section) — this
-     script now calls Marketstack (https://marketstack.com), a real,
-     commercially-licensed provider, instead.
-  2. Marketstack's Basic plan is METERED: 10,000 requests/month, not
-     unlimited like yfinance was. A naive port of the old script (full
-     5-year daily history, refetched from scratch every 15 minutes, one
-     ticker at a time) would blow that budget in well under a day. So this
-     version is also a genuine redesign, not just a find-and-replace:
-       - ONE batched request per run covers every tracked ticker at once
-         (Marketstack's /v1/eod takes a comma-separated symbols list) —
-         never one request per ticker.
-       - Each run only fetches a short recent window (FETCH_WINDOW_DAYS,
-         below) instead of full history — the 1Y/6M/All ranges are
-         maintained incrementally, by merging that fresh window onto
-         whatever this SAME script already committed last run (read back
-         from market_data.json, which this script also writes — the repo
-         itself is the only persistent state between runs; see
-         `merge_and_window` below). A full history refetch would need
-         dozens of paginated requests every single run; incremental merge
-         needs exactly one.
-       - This script no longer computes or stores dividend/split data —
-         that's now the app's own job (App.js's fetchMarketCorporateActions
-         calls the Cloudflare Worker's /marketstack/eod endpoint directly,
-         on demand, per position) so it doesn't cost this shared, metered
-         budget at all.
-     See the main Vestly repo's README "Marketstack quota budget" section
-     for the actual monthly math this design is built around.
+  - Every run now fetches each tracked ticker's FULL relevant history fresh
+    (one batched `yfinance.download()` call covering all 13 tickers plus
+    the benchmark at once — see `fetch_all_history` below), instead of
+    v43's small 7-day window incrementally merged onto whatever the
+    previous run had already committed. yfinance is free and unlimited, so
+    there's no quota reason to fetch less than the full window every time,
+    and a full-refetch design is simpler and more self-healing (a bad
+    commit, or a market_data.json that's gone missing entirely, fixes
+    itself on the very next run instead of needing weeks to backfill
+    incrementally).
+  - `merge_and_window` (v43's incremental range-merge core) is gone,
+    replaced by the much simpler `window_and_bucket`, which just collapses
+    a fresh, complete daily series to one point per bucket and trims it to
+    the range's window — no prior-run union step needed, because there's
+    no "prior run's window" to union with anymore.
+  - The BACKFILL_DAYS escape hatch (and its workflow_dispatch input in
+    refresh.yml) is gone too — it existed only to work around the
+    incremental design's slow cold-start; a full-refetch design has no
+    cold-start problem to work around.
+  - All 13 tracked tickers are covered again, including the six
+    Hong Kong/Singapore-listed names that were confirmed DEAD on
+    Marketstack's feed (see this file's own git history for that
+    research) — that gap was specific to Marketstack's account/plan, not a
+    real Yahoo Finance limitation; Yahoo has always covered HKEX and SGX.
+  - This script still does not compute or store dividend/split data —
+    that's App.js's own job (fetchMarketCorporateActions calls Yahoo's
+    chart endpoint directly, on demand, per position), unrelated to this
+    cloud pipeline either way.
 
-  FX rates come from a SEPARATE, free, no-API-key source — Frankfurter
-  (api.frankfurter.dev, ECB-backed) — deliberately decoupled from
-  Marketstack so currency conversion never touches the metered quota at
-  all, however often this runs.
+  FX rates still come from Frankfurter (api.frankfurter.dev, ECB-backed,
+  free, no API key) — this half of the pipeline was never Marketstack- or
+  Yahoo-specific and is completely unchanged by this reversion.
 
-Requires the MARKETSTACK_API_KEY environment variable to be set (in
-GitHub Actions, a repository secret — see the main repo's README for the
-one-time "add a repository secret" steps). Get your own key free at
-marketstack.com (the free tier is enough to confirm this script runs; the
-real monthly volume needs the Basic plan — same key, no code change).
+Requires the `yfinance` package (see requirements.txt) but no API key at
+all — unlike Marketstack, Yahoo's unofficial endpoints (which is what
+yfinance itself calls under the hood) need no account or credential.
 
 You should not normally need to run this by hand — GitHub Actions runs it
 automatically on a schedule (see refresh.yml). To test it manually: repo's
-Actions tab → "Refresh market data" workflow → "Run workflow".
+Actions tab -> "Refresh market data" workflow -> "Run workflow".
 """
 
 import json
-import os
-import sys
-import time
-import urllib.error
+import math
 import urllib.parse
 import urllib.request
+import time
 from datetime import datetime, timedelta, timezone
 
-MARKETSTACK_BASE = "https://api.marketstack.com/v1"
+import pandas as pd
+import yfinance as yf
+
 FRANKFURTER_BASE = "https://api.frankfurter.dev/v1"
 OUT_PATH = "market_data.json"
 
-# ticker (the app's own identifier, App.js position.ticker/market.prices key)
-#   -> marketstack: the real Marketstack symbol to fetch (MIC-suffixed —
-#      see cloudflare-worker/worker.js's MIC_CURRENCY table in the main
-#      repo for the same suffix convention), or None if Marketstack simply
-#      doesn't carry this listing at all (confirmed live for the two SGX
-#      depositary receipts below — see the main repo's "Leaving Yahoo
-#      Finance" research). A None entry is skipped entirely by the fetch
-#      (costs nothing) and left out of `prices`/`history` in the output,
-#      same as any other ticker the cloud script doesn't cover — the app's
-#      own on-demand live-fetch fallback would normally be the fix, EXCEPT
-#      it goes through the exact same Marketstack account and hits the
-#      exact same gap below, so for a HKEX/SGX-restricted ticker there's
-#      currently no working fallback at all — see that comment for what
-#      would actually fix it.
-#
-# CONFIRMED 2026-09-07, live, on the real paid Basic plan: Hong Kong
-# (XHKG) and Singapore (XSES) exchange EOD data returns completely empty
-# — zero rows over date ranges up to a full month — for tickers Marketstack's
-# OWN ticker-search index lists with "has_eod": true (e.g. "0857.XHKG" for
-# PetroChina). Shenzhen (XSHE) and every US ticker fetch fine on this same
-# plan/key. NOT a plan-tier restriction (that was the first, wrong guess) —
-# a follow-up check on /v1/eod/latest (no date filter) found one real row
-# dated 2023-10-09, and a 2023-01 date window returned full real OHLCV, so
-# the feed WAS live through early/mid 2023 and then froze completely. Cross-
-# referenced against Marketstack's own (archived June 2024) GitHub issue
-# tracker: multiple OTHER non-US exchanges — London, Sweden, Denmark — show
-# the exact same "no data since ~Oct 2023" pattern in still-open issues.
-# Reads as a broader, apparently permanent Marketstack pipeline failure
-# across several non-US exchanges, not something fixable client-side, and
-# not likely to be fixed by support (repo archived, issues unresolved 2+
-# years). Treated as a standing limitation (see the main repo's README
-# "Marketstack quota budget" section for the full writeup and how this
-# changes the actual coverage count from the original 11-of-13 estimate).
-# marketstack: None below for these four is what that decision looks like
-# in code — same treatment as the two SGX depositary receipts, which were
-# already known to be missing entirely.
-# name/exchange/category: display metadata only, shown in the app.
+# ticker (the app's own identifier, App.js position.ticker/market.prices key,
+# AND the exact string this script hands to yfinance — Yahoo's own ticker
+# format already carries the right exchange suffix, e.g. ".HK"/".SI"/".SZ",
+# so unlike the Marketstack era there's no separate translated-symbol field
+# needed at all here). name/exchange/category/currency: display metadata
+# only, shown in the app. All 13 are real, live Yahoo Finance coverage —
+# the six HKEX/SGX names that were confirmed dead on Marketstack's feed
+# (see git history) are ordinary tickers again under Yahoo.
 TICKERS = {
-    "0857.HK":   {"marketstack": None,           "name": "PetroChina H",                          "exchange": "HKEX",     "category": "Equities", "currency": "HKD"},
-    "MSFT":      {"marketstack": "MSFT",         "name": "Microsoft",                             "exchange": "NASDAQ",   "category": "Equities", "currency": "USD"},
-    "META":      {"marketstack": "META",         "name": "Meta Platforms",                        "exchange": "NASDAQ",   "category": "Equities", "currency": "USD"},
-    "HXXD.SI":   {"marketstack": None,           "name": "Xiaomi (SGX Depositary Receipt)",       "exchange": "SGX",      "category": "Equities", "currency": "SGD"},
-    "300750.SZ": {"marketstack": "300750.XSHE",  "name": "Amperex Tech / CATL (A-share)",         "exchange": "Shenzhen", "category": "Equities", "currency": "CNY"},
-    "SE":        {"marketstack": "SE",           "name": "Sea Limited",                           "exchange": "NYSE",     "category": "Equities", "currency": "USD"},
-    "HBBD.SI":   {"marketstack": None,           "name": "Alibaba (SGX Depositary Receipt)",      "exchange": "SGX",      "category": "Equities", "currency": "SGD"},
-    "O39.SI":    {"marketstack": None,           "name": "OCBC Bank",                             "exchange": "SGX",      "category": "Equities", "currency": "SGD"},
-    "N2IU.SI":   {"marketstack": None,           "name": "Mapletree Pan Asia Commercial Trust",   "exchange": "SGX",      "category": "REITs",    "currency": "SGD"},
-    "C38U.SI":   {"marketstack": None,           "name": "CapitaLand Integrated Commercial Trust","exchange": "SGX",      "category": "REITs",    "currency": "SGD"},
-    "GOOGL":     {"marketstack": "GOOGL",        "name": "Alphabet A",                            "exchange": "NASDAQ",   "category": "Equities", "currency": "USD"},
-    "AAPL":      {"marketstack": "AAPL",         "name": "Apple",                                 "exchange": "NASDAQ",   "category": "Equities", "currency": "USD"},
-    "NVDA":      {"marketstack": "NVDA",         "name": "NVIDIA",                                "exchange": "NASDAQ",   "category": "Equities", "currency": "USD"},
+    "0857.HK":   {"name": "PetroChina H",                           "exchange": "HKEX",     "category": "Equities", "currency": "HKD"},
+    "MSFT":      {"name": "Microsoft",                              "exchange": "NASDAQ",   "category": "Equities", "currency": "USD"},
+    "META":      {"name": "Meta Platforms",                         "exchange": "NASDAQ",   "category": "Equities", "currency": "USD"},
+    "HXXD.SI":   {"name": "Xiaomi (SGX Depositary Receipt)",        "exchange": "SGX",      "category": "Equities", "currency": "SGD"},
+    "300750.SZ": {"name": "Amperex Tech / CATL (A-share)",          "exchange": "Shenzhen", "category": "Equities", "currency": "CNY"},
+    "SE":        {"name": "Sea Limited",                            "exchange": "NYSE",     "category": "Equities", "currency": "USD"},
+    "HBBD.SI":   {"name": "Alibaba (SGX Depositary Receipt)",       "exchange": "SGX",      "category": "Equities", "currency": "SGD"},
+    "O39.SI":    {"name": "OCBC Bank",                              "exchange": "SGX",      "category": "Equities", "currency": "SGD"},
+    "N2IU.SI":   {"name": "Mapletree Pan Asia Commercial Trust",    "exchange": "SGX",      "category": "REITs",    "currency": "SGD"},
+    "C38U.SI":   {"name": "CapitaLand Integrated Commercial Trust", "exchange": "SGX",      "category": "REITs",    "currency": "SGD"},
+    "GOOGL":     {"name": "Alphabet A",                             "exchange": "NASDAQ",   "category": "Equities", "currency": "USD"},
+    "AAPL":      {"name": "Apple",                                  "exchange": "NASDAQ",   "category": "Equities", "currency": "USD"},
+    "NVDA":      {"name": "NVIDIA",                                 "exchange": "NASDAQ",   "category": "Equities", "currency": "USD"},
 }
 
 # World-index ticker for the app's "against a benchmark" comparison on
 # Insights (see App.js's BENCHMARK_TICKER). Fetched alongside your actual
 # holdings, on the exact same date axis per range — not a holding, so it's
-# deliberately kept out of TICKERS/prices (it won't show up in your
-# allocation or holdings list), only its historical series is used.
+# deliberately kept out of TICKERS/the top-level `prices` output (it won't
+# show up in your allocation or holdings list), only its historical series
+# is used. Same ticker string on Yahoo as everywhere else, no translation.
 BENCHMARK_TICKER = "VT"
-BENCHMARK_MARKETSTACK = "VT"
 
 # Currencies that ever need converting to the app's base currency. SGD
 # needs no conversion (it IS the base) but is still stored explicitly in
@@ -134,38 +108,18 @@ BENCHMARK_MARKETSTACK = "VT"
 # buildValueSeries already expect.
 BASE_CURRENCY = "SGD"
 
-# v44 follow-up (David-requested, after the "let's test UK, Japan and
-# Frankfurt" live spot-check confirmed Frankfurt/XETRA/Toronto/Amsterdam/
-# Brazil all return real Marketstack price data): GBP/EUR/CAD/BRL are
-# fetched UNCONDITIONALLY here, not just derived from TICKERS below. TICKERS
-# is David's own fixed, manually-curated list — deriving FX_CURRENCIES from
-# it alone would mean these four currencies only start getting real rates
-# the day David's own TICKERS table happens to include one, which does
-# nothing for any position — David's or any future user's — added through
-# the app's own on-demand Add Position flow (a completely separate code
-# path from this cloud script, see App.js's CURRENCIES comment). Widening
-# App.js's CURRENCIES to actually USE these rates is a paired change — see
-# that file's own CURRENCIES/CURRENCY_SYMBOLS comments; this file alone
-# only supplies the rate, App.js decides who's allowed to auto-lock to it.
+# GBP/EUR/CAD/BRL are fetched UNCONDITIONALLY here, not just derived from
+# TICKERS below. TICKERS is David's own fixed, manually-curated list —
+# deriving FX_CURRENCIES from it alone would mean these four currencies
+# only start getting real rates the day David's own TICKERS table happens
+# to include one, which does nothing for any position — David's or any
+# future user's — added through the app's own on-demand Add Position flow
+# (a completely separate code path from this cloud script, see App.js's
+# CURRENCIES comment).
 ALWAYS_FETCHED_FX_CURRENCIES = {"GBP", "EUR", "CAD", "BRL"}
 FX_CURRENCIES = sorted(
     ({t["currency"] for t in TICKERS.values()} | ALWAYS_FETCHED_FX_CURRENCIES) - {BASE_CURRENCY}
 )
-
-# How many trailing calendar days of DAILY bars to fetch fresh, every run.
-# This is deliberately small — see the module docstring's point 2. 7 days
-# covers a full trading week (so a single missed run, or a 2-3 day
-# exchange holiday, still gets fully backfilled by the NEXT run) while
-# keeping each run's request comfortably inside a single Marketstack page
-# even at the smallest page size this project has ever observed live
-# (100 rows — see the main repo's "Marketstack quota budget" section):
-# ~8 symbols x 7 days = ~56 rows (7 real holdings Marketstack actually
-# covers, plus VT — see TICKERS' own comment on the 6 that don't), well
-# under 100. If Marketstack ever
-# returns more rows than one page for this window, `marketstack_eod`
-# below still paginates correctly — it just costs more than 1 request
-# that run, not a hard failure.
-FETCH_WINDOW_DAYS = 7
 
 # Per-range bucketing + how many days back each range's final series is
 # trimmed to keep — same day-window/bucket shape as App.js's own
@@ -180,10 +134,73 @@ RANGE_CONFIG = {
     "All": {"bucket": "month", "window_days": 1850},
 }
 
+# v46: how many trailing calendar days of DAILY bars to fetch fresh, every
+# run. Unlike v43's FETCH_WINDOW_DAYS (deliberately tiny, 7 days, to stay
+# under Marketstack's metered quota), this now just needs to cover the
+# LONGEST range's own window (RANGE_CONFIG["All"], 1850 days) plus a small
+# buffer — because every run re-fetches full history from scratch (see the
+# module docstring), there's no incremental merge needing only a short
+# recent slice anymore. yfinance has no per-request cost that makes a
+# ~5-year window across 14 tickers in one batched call expensive.
+HISTORY_FETCH_DAYS = max(cfg["window_days"] for cfg in RANGE_CONFIG.values()) + 30
+
 
 # --------------------------------------------------------------------- #
-# HTTP helpers — plain urllib, no requests dependency needed for two
-# simple GET-JSON APIs, keeping requirements.txt empty (stdlib only).
+# Yahoo Finance, via yfinance
+# --------------------------------------------------------------------- #
+
+def fetch_all_history(tickers, date_from, date_to):
+    """One batched `yfinance.download()` call across every tracked ticker
+    (plus the benchmark) at once, instead of one request per ticker —
+    mirrors the old Marketstack version's single comma-separated /eod
+    call, but for a genuinely free/unlimited provider there's no quota
+    reason to batch this carefully; it's just faster and simpler than
+    looping. Returns {ticker: {date_str: close}}, closes rounded to 4
+    decimal places same as before. A ticker yfinance has no data for at
+    all (delisted, typo, a genuine gap) is simply absent from the result
+    rather than raising — callers already treat a missing/empty entry as
+    "no fresh data this run" the same way a Marketstack gap used to look."""
+    if not tickers:
+        return {}
+    raw = yf.download(
+        tickers=tickers,
+        start=date_from,
+        end=date_to,
+        interval="1d",
+        group_by="ticker",
+        auto_adjust=False,
+        progress=False,
+        threads=True,
+    )
+    out = {}
+    if raw is None or raw.empty:
+        return out
+    for ticker in tickers:
+        try:
+            if isinstance(raw.columns, pd.MultiIndex):
+                if ticker not in raw.columns.get_level_values(0):
+                    continue
+                closes = raw[ticker]["Close"]
+            else:
+                # Only reachable if `tickers` had exactly one element —
+                # yfinance drops the ticker level of the column MultiIndex
+                # entirely in that case.
+                closes = raw["Close"]
+        except KeyError:
+            continue
+        daily = {}
+        for ts, close in closes.items():
+            if close is None or (isinstance(close, float) and math.isnan(close)):
+                continue
+            daily[ts.strftime("%Y-%m-%d")] = round(float(close), 4)
+        if daily:
+            out[ticker] = daily
+    return out
+
+
+# --------------------------------------------------------------------- #
+# HTTP helper for Frankfurter — plain urllib, no requests dependency
+# needed for a simple GET-JSON API.
 # --------------------------------------------------------------------- #
 
 def http_get_json(url, timeout=30, retries=2):
@@ -201,85 +218,11 @@ def http_get_json(url, timeout=30, retries=2):
 
 
 # --------------------------------------------------------------------- #
-# Marketstack
-# --------------------------------------------------------------------- #
-
-MARKETSTACK_PAGE_LIMIT = 1000
-
-def marketstack_eod(symbols, date_from, date_to, api_key):
-    """One (usually) request across every symbol at once, via Marketstack's
-    comma-separated `symbols` param. Paginates defensively if the account's
-    real page size ever returns more than one page for this window — see
-    FETCH_WINDOW_DAYS' own comment for why that's not expected to happen in
-    normal operation. Returns a flat list of {symbol, date, close} dicts
-    (dividend/split_factor are also present on each row but deliberately
-    unused here — see the module docstring's point 2).
-
-    v44 bug fix, confirmed LIVE: this used to stop paginating once
-    `offset >= pagination.total`. Confirmed directly against the real API
-    (a single symbol, full 5-year window, `limit=1000`) that `total` comes
-    back as EXACTLY `count`/`limit` — 1000 — once the true match count
-    exceeds one page, not the real total row count. Trusting it silently
-    truncated a BACKFILL_DAYS run to ~1000 rows total (≈6 months across 8
-    symbols) even though real, older data genuinely exists (confirmed via
-    a separate live request for January 2023 alone). Now paginates purely
-    on page SHAPE instead: keep requesting the next page as long as the
-    previous one came back FULL (exactly MARKETSTACK_PAGE_LIMIT rows) —
-    a page shorter than that (including empty) is the only reliable
-    "nothing more to fetch" signal, regardless of what `pagination.total`
-    claims. Harmless for a normal 7-day run (~56 rows, always page 1 of
-    1) — this only changes behavior once a query's true results exceed a
-    single page, which BACKFILL_DAYS is the one thing that does."""
-    if not symbols:
-        return []
-    rows = []
-    offset = 0
-    seen_pages = 0
-    while True:
-        params = {
-            "access_key": api_key,
-            "symbols": ",".join(symbols),
-            "date_from": date_from,
-            "date_to": date_to,
-            "limit": MARKETSTACK_PAGE_LIMIT,
-            "offset": offset,
-        }
-        url = f"{MARKETSTACK_BASE}/eod?{urllib.parse.urlencode(params)}"
-        payload = http_get_json(url)
-        if "error" in payload:
-            err = payload["error"]
-            raise RuntimeError(f"Marketstack error: {err.get('code')} — {err.get('message')}")
-        data = payload.get("data", [])
-        rows.extend(data)
-        seen_pages += 1
-        offset += len(data)
-        if len(data) < MARKETSTACK_PAGE_LIMIT or seen_pages > 50:  # short/empty page = real end; 50 is a hard safety cap, not an expected case
-            break
-    return rows
-
-
-def normalize_eod_rows(rows):
-    """[{symbol, date, close}, ...] -> {symbol: {date_str: close}}. Marketstack
-    dates come back as e.g. '2026-09-05T00:00:00+0000' — trimmed to the
-    plain YYYY-MM-DD the app's history.dates entries already use."""
-    out = {}
-    for row in rows:
-        symbol = row.get("symbol")
-        raw_date = row.get("date")
-        close = row.get("close")
-        if not symbol or not raw_date or close is None:
-            continue
-        date_str = str(raw_date)[:10]
-        out.setdefault(symbol, {})[date_str] = round(float(close), 4)
-    return out
-
-
-# --------------------------------------------------------------------- #
-# Frankfurter (FX) — free, no key, decoupled from the Marketstack budget
-# entirely (see module docstring). fx_rates_to_sgd's own convention
-# (App.js's fxConvert) is "units of SGD per 1 unit of X", so every rate
-# Frankfurter gives back (which is naturally "units of X per 1 unit of
-# base") gets inverted below.
+# Frankfurter (FX) — free, no key, unrelated to the market-data provider
+# either way (Yahoo now, Marketstack before, yfinance before that).
+# fx_rates_to_sgd's own convention (App.js's fxConvert) is "units of SGD
+# per 1 unit of X", so every rate Frankfurter gives back (which is
+# naturally "units of X per 1 unit of base") gets inverted below.
 # --------------------------------------------------------------------- #
 
 def frankfurter_latest(base, symbols):
@@ -311,8 +254,8 @@ def frankfurter_series(base, symbols, date_from, date_to):
 
 
 # --------------------------------------------------------------------- #
-# Incremental range merge — the core of staying within the Marketstack
-# budget. See the module docstring's point 2 and RANGE_CONFIG's comment.
+# Bucketing — unchanged, reusable, provider-agnostic (same logic under
+# Marketstack, and before that under the original yfinance version).
 # --------------------------------------------------------------------- #
 
 def bucket_key_week(date_obj):
@@ -351,30 +294,29 @@ def collapse_to_buckets(daily, bucket_kind):
     return {rep_date: val for rep_date, val in buckets.values()}
 
 
-def merge_and_window(prior_points, fresh_points, bucket_kind, window_days):
-    """The one function that makes every range incremental. `prior_points`
-    is what THIS SAME range held last run (read back from the committed
-    market_data.json); `fresh_points` is this run's newly-fetched daily
-    window. Unions them (fresh wins on an exact-date collision — a Marketstack
-    revision to a recent close), collapses to one point per bucket, then
-    trims to the trailing `window_days`. Buckets entirely outside the fresh
-    window are untouched (nothing to override them with) — that's what
-    keeps 6M/1Y/All "incrementally maintained" instead of needing a full
-    refetch every run. Returns {} if there's nothing at all yet (a brand
-    new ticker, or every fetch attempt so far has failed)."""
-    union = dict(prior_points)
-    union.update(fresh_points)
-    if not union:
+def window_and_bucket(daily_points, bucket_kind, window_days):
+    """v46 replacement for v43's merge_and_window: yfinance has no metered
+    quota to protect, so this script now fetches each ticker's FULL
+    relevant history fresh every run (see fetch_all_history) instead of
+    incrementally merging a small window onto whatever the previous run
+    committed. This is just the second half of the old function — collapse
+    to one point per bucket, then trim to the trailing `window_days` — with
+    no prior-run union step, since `daily_points` here is already the
+    complete, freshly-fetched series, not a short recent window. Returns {}
+    for an empty input."""
+    if not daily_points:
         return {}
-    collapsed = collapse_to_buckets(union, bucket_kind)
+    collapsed = collapse_to_buckets(daily_points, bucket_kind)
+    if not collapsed:
+        return {}
     cutoff = (datetime.strptime(max(collapsed.keys()), "%Y-%m-%d").date() - timedelta(days=window_days)).isoformat()
     return {d: v for d, v in collapsed.items() if d >= cutoff}
 
 
 # --------------------------------------------------------------------- #
 # Assembling one range's full output (shared date axis, forward/back-fill
-# per ticker — same behaviour the old yfinance/pandas version had via
-# reindex(ffill).bfill(), reimplemented here without pandas).
+# per ticker — same behaviour the original yfinance/pandas version had via
+# reindex(ffill).bfill(), reimplemented here without pandas for this step).
 # --------------------------------------------------------------------- #
 
 def align_series(per_key_points, date_axis):
@@ -401,44 +343,28 @@ def align_series(per_key_points, date_axis):
     return out
 
 
-def build_range(range_key, cfg, prior_history, fresh_prices_daily, fresh_fx_daily):
-    prior = (prior_history or {}).get(range_key) or {}
-    prior_dates = prior.get("dates") or []
-    prior_prices = prior.get("prices") or {}
-    prior_fx = prior.get("fx") or {}
-
-    def prior_points_for(series_by_key, key):
-        arr = series_by_key.get(key)
-        if not arr or not prior_dates:
-            return {}
-        return {d: v for d, v in zip(prior_dates, arr) if v is not None}
-
-    merged_prices = {}
+def build_range(range_key, cfg, fresh_prices_daily, fresh_fx_daily):
+    """v46: simplified — no more `prior_history` argument, since there's no
+    incremental merge left to do (see window_and_bucket). Each range is
+    built fresh, every run, straight from this run's own complete fetch."""
+    bucketed_prices = {}
     for key, daily in fresh_prices_daily.items():
-        merged = merge_and_window(prior_points_for(prior_prices, key), daily, cfg["bucket"], cfg["window_days"])
-        if merged:
-            merged_prices[key] = merged
-    # Tickers with no fresh data this run (not covered by Marketstack, or a
-    # failed fetch) still keep whatever this range already had, un-merged —
-    # stale beats missing, same philosophy as the rest of this pipeline.
-    for key, arr in prior_prices.items():
-        if key not in merged_prices and key not in fresh_prices_daily:
-            merged = merge_and_window(prior_points_for(prior_prices, key), {}, cfg["bucket"], cfg["window_days"])
-            if merged:
-                merged_prices[key] = merged
+        bucketed = window_and_bucket(daily, cfg["bucket"], cfg["window_days"])
+        if bucketed:
+            bucketed_prices[key] = bucketed
 
-    merged_fx = {}
+    bucketed_fx = {}
     for cur in FX_CURRENCIES:
-        merged = merge_and_window(prior_points_for(prior_fx, cur), fresh_fx_daily.get(cur, {}), cfg["bucket"], cfg["window_days"])
-        if merged:
-            merged_fx[cur] = merged
+        bucketed = window_and_bucket(fresh_fx_daily.get(cur, {}), cfg["bucket"], cfg["window_days"])
+        if bucketed:
+            bucketed_fx[cur] = bucketed
 
-    if not merged_prices:
+    if not bucketed_prices:
         return None
 
-    date_axis = sorted(set().union(*[set(v.keys()) for v in merged_prices.values()]))
-    prices_out = align_series(merged_prices, date_axis)
-    fx_out = align_series(merged_fx, date_axis)
+    date_axis = sorted(set().union(*[set(v.keys()) for v in bucketed_prices.values()]))
+    prices_out = align_series(bucketed_prices, date_axis)
+    fx_out = align_series(bucketed_fx, date_axis)
     fx_out["SGD"] = [1.0] * len(date_axis)
 
     return {"dates": date_axis, "prices": prices_out, "fx": fx_out}
@@ -448,94 +374,35 @@ def build_range(range_key, cfg, prior_history, fresh_prices_daily, fresh_fx_dail
 # main
 # --------------------------------------------------------------------- #
 
-def resolve_fetch_window_days(backfill_raw, default_days=FETCH_WINDOW_DAYS):
-    """Pure. `backfill_raw` is the raw BACKFILL_DAYS env value (a string,
-    possibly empty/None) — see main()'s own BACKFILL_DAYS comment for why
-    this exists. Returns (days_to_use, message_or_None): the normal
-    `default_days` unless `backfill_raw` is a whole number strictly greater
-    than it, in which case that larger number wins. A blank/missing value,
-    a non-numeric value, or a value that isn't actually larger than the
-    default all fall back to `default_days` — the last two log an
-    explanatory message so a typo'd input doesn't silently do nothing."""
-    raw = (backfill_raw or "").strip()
-    if not raw:
-        return default_days, None
-    try:
-        backfill_days = int(raw)
-    except ValueError:
-        return default_days, f"BACKFILL_DAYS={raw!r} isn't a whole number — ignoring it, using the normal {default_days}-day window."
-    if backfill_days > default_days:
-        return backfill_days, f"BACKFILL_DAYS={backfill_days} set — this run fetches {backfill_days} days instead of the normal {default_days}."
-    return default_days, f"BACKFILL_DAYS={raw} is not larger than the normal {default_days}-day window — ignoring it."
-
-
 def main():
-    api_key = os.environ.get("MARKETSTACK_API_KEY")
-    if not api_key:
-        print("MARKETSTACK_API_KEY is not set — see this script's own docstring. Aborting without touching market_data.json.")
-        sys.exit(1)
-
     try:
         with open(OUT_PATH, "r") as f:
             previous = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         previous = {}
-    prior_history = previous.get("history") or {}
     prior_prices = previous.get("prices") or {}
 
-    # v44: one-time (or occasional) backfill escape hatch. Normal runs fetch
-    # only FETCH_WINDOW_DAYS (7) and lean on merge_and_window to build up
-    # 6M/1Y/All history incrementally, a bit more each run — by design, see
-    # this file's own module docstring. That's the right steady-state
-    # behaviour, but it has a real cold-start cost: if prior_history is ever
-    # lost (an empty/corrupted market_data.json committed by mistake, or the
-    # very first run after this script was introduced), 6M/1Y/All start
-    # from near-nothing and would otherwise take WEEKS (weekly buckets) to
-    # MONTHS (monthly buckets) to refill on their own, even though
-    # Marketstack itself has years of real history available right now (see
-    # this file's own docstring point 2, and the main repo's README, on
-    # Marketstack's actual "10 Years History" coverage on the Basic plan).
-    # Setting the BACKFILL_DAYS env var (via this repo's Actions tab -> "Run
-    # workflow" -> backfill_days input, see refresh.yml) fetches that many
-    # days in ONE run instead of the usual 7, letting build_range's normal
-    # bucketing/windowing immediately populate 6M/1Y/All for real, rather
-    # than waiting on the slow incremental path. Costs more of the monthly
-    # Marketstack quota than a normal run (still cheap — ~8 symbols x 1900
-    # days is roughly a dozen paginated /eod requests, not a dozen PER
-    # symbol; see marketstack_eod's own pagination), and is meant to be used
-    # rarely, not every run — leave the input blank for the normal schedule.
-    fetch_window_days, backfill_msg = resolve_fetch_window_days(os.environ.get("BACKFILL_DAYS"))
-    if backfill_msg:
-        print(backfill_msg)
-
     today = datetime.now(timezone.utc).date()
-    date_from = (today - timedelta(days=fetch_window_days)).isoformat()
+    date_from = (today - timedelta(days=HISTORY_FETCH_DAYS)).isoformat()
     date_to = today.isoformat()
 
-    ms_symbol_to_ticker = {info["marketstack"]: ticker for ticker, info in TICKERS.items() if info["marketstack"]}
-    ms_symbol_to_ticker[BENCHMARK_MARKETSTACK] = BENCHMARK_TICKER
-    symbols = list(ms_symbol_to_ticker.keys())
+    tickers_to_fetch = list(TICKERS.keys()) + [BENCHMARK_TICKER]
 
-    print(f"Fetching {len(symbols)} symbols' last {fetch_window_days} days from Marketstack ({date_from}..{date_to})...")
+    print(f"Fetching {len(tickers_to_fetch)} tickers' full history from Yahoo Finance ({date_from}..{date_to})...")
     failed = []
-    fresh_by_symbol = {}
+    fresh_by_ticker = {}
     try:
-        rows = marketstack_eod(symbols, date_from, date_to, api_key)
-        fresh_by_symbol = normalize_eod_rows(rows)
+        fresh_by_ticker = fetch_all_history(tickers_to_fetch, date_from, date_to)
     except Exception as e:
-        print(f"  Marketstack fetch FAILED entirely this run: {e}")
+        print(f"  Yahoo Finance fetch FAILED entirely this run: {e}")
         print("  Falling back to last run's data untouched for every ticker.")
 
-    fresh_by_ticker = {}
-    for ms_symbol, ticker in ms_symbol_to_ticker.items():
-        daily = fresh_by_symbol.get(ms_symbol)
-        if daily:
-            fresh_by_ticker[ticker] = daily
-        elif ticker != BENCHMARK_TICKER:
+    for ticker in TICKERS:
+        if ticker not in fresh_by_ticker:
             failed.append(ticker)
             print(f"  {ticker:<11} no fresh data this run — keeping last known price/history.")
 
-    print("Fetching FX rates (Frankfurter, free — doesn't touch the Marketstack budget)...")
+    print("Fetching FX rates (Frankfurter, free, unrelated to the price provider)...")
     try:
         fx_now = frankfurter_latest(BASE_CURRENCY, FX_CURRENCIES)
     except Exception as e:
@@ -548,12 +415,16 @@ def main():
     try:
         fx_daily = frankfurter_series(BASE_CURRENCY, FX_CURRENCIES, date_from, date_to)
     except Exception as e:
-        print(f"  Frankfurter historical-series fetch failed: {e} — this run's history merge will lean on prior data only.")
+        print(f"  Frankfurter historical-series fetch failed: {e} — this run's history will lean on price data only.")
         fx_daily = {}
 
     # Current prices (top-level `prices`, used for today's holdings values)
-    # — derived from the SAME fresh daily window, not from the bucketed
+    # — derived from the SAME fresh daily fetch, not from the bucketed
     # history, so it's always as current as this run's own fetch allows.
+    # A ticker with no fresh data this run still keeps whatever price this
+    # script last committed — stale beats missing — but (unlike v43's
+    # history ranges) there's no equivalent fallback needed for history
+    # itself anymore, since a full refetch either has the data or doesn't.
     prices_out = {}
     for ticker, info in TICKERS.items():
         daily = fresh_by_ticker.get(ticker)
@@ -570,13 +441,11 @@ def main():
             print(f"  {ticker:<11} OK   {info['name']}  {price} {info['currency']}")
         elif ticker in prior_prices:
             prices_out[ticker] = prior_prices[ticker]  # stale beats missing
-        elif info["marketstack"] is None:
-            print(f"  {ticker:<11} not covered by Marketstack — skipped (see TICKERS' own comment).")
 
-    print("Merging into 1W/1M/6M/1Y/All history...")
+    print("Bucketing into 1W/1M/6M/1Y/All history...")
     history = {}
     for range_key, cfg in RANGE_CONFIG.items():
-        built = build_range(range_key, cfg, prior_history, fresh_by_ticker, fx_daily)
+        built = build_range(range_key, cfg, fresh_by_ticker, fx_daily)
         if built:
             history[range_key] = built
             print(f"  {range_key:<4} {len(built['dates'])} dates, {len(built['prices'])} tickers")
