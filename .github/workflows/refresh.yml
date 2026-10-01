@@ -2,41 +2,31 @@ name: Refresh market data
 
 on:
   schedule:
-    # v43 (leaving Yahoo Finance): loosened from every 15 minutes back to
-    # roughly hourly, on purpose — Marketstack's Basic plan is END-OF-DAY
-    # data only (not intraday/real-time), so refreshing more often than
-    # once per trading-day close was never buying anything, and Marketstack
-    # is METERED (10,000 requests/month), unlike the old free/unlimited
-    # yfinance pull this replaced. Still offset from the round hour mark
-    # (GitHub's busiest scheduling window, same reasoning as the old
-    # 6/21/36/51 offset), and still paired with the Cloudflare Worker's own
-    # independent Cron Trigger below as a genuinely redundant backstop —
-    # see the main Vestly repo's README "Keeping market data fresh" and
-    # "Marketstack quota budget" sections for the full reasoning and the
-    # actual monthly request math this cadence is built around.
-    - cron: '14 * * * *'
+    # v43 (leaving Yahoo Finance) loosened this from every 15 minutes to
+    # roughly hourly — Marketstack's Basic plan was END-OF-DAY data only
+    # and metered (10,000 requests/month).
+    #
+    # v46 (David's personal-use pivot, back to Yahoo Finance, 2026-09-30):
+    # reverted to the original ~15-min cadence, offset from the round hour
+    # mark (GitHub's busiest scheduling window) — this is the exact
+    # original 6/21/36/51 offset this project used before v43. yfinance has
+    # no metered quota to protect and Yahoo's data is genuinely intraday,
+    # so nothing is bought by refreshing any less often than this. Still
+    # paired with the Cloudflare Worker's own independent Cron Trigger as a
+    # genuinely redundant backstop (kept 5 minutes after this one) — see
+    # the main Vestly repo's README "Keeping market data fresh" section.
+    - cron: '6,21,36,51 * * * *'
   # Lets you trigger it by hand from the Actions tab, e.g. to test it once
   # right after setting this up, without waiting for the schedule. Also
   # what the Cloudflare Worker above calls via the REST API, on its own
-  # independent hourly schedule.
+  # independent schedule.
   workflow_dispatch:
-    inputs:
-      backfill_days:
-        description: >-
-          Leave blank for a normal run. Only fill this in to rebuild 6M/1Y/All
-          history quickly after it's been reset (e.g. market_data.json got
-          overwritten by mistake) — enter how many days back to fetch in this
-          ONE run, e.g. 1900. See update_market_data.py's BACKFILL_DAYS
-          comment for the full reasoning. Costs a bit more of the monthly
-          Marketstack quota than a normal run — still cheap, just don't run
-          it repeatedly.
-        required: false
-        default: ''
 
 # Needed so this workflow can commit the updated market_data.json back into
 # the repo using the built-in token — no extra secrets or personal access
-# tokens required for THIS permission (a separate secret, MARKETSTACK_API_KEY
-# below, is required for the script itself to fetch real prices).
+# tokens required for this permission. v46: unlike the Marketstack era,
+# update_market_data.py itself now needs no API key/secret at all — Yahoo
+# Finance's unofficial endpoints (called via yfinance) require none.
 permissions:
   contents: write
 
@@ -52,20 +42,13 @@ jobs:
 
       - run: pip install -r requirements.txt
 
+      # v46: no env vars needed here anymore — Yahoo Finance's unofficial
+      # endpoints (called via yfinance) require no API key, unlike the
+      # MARKETSTACK_API_KEY secret this step used to pass through. If you
+      # previously added that repository secret, it's safe to delete from
+      # this repo's Settings -> Secrets and variables -> Actions — nothing
+      # here reads it anymore.
       - run: python update_market_data.py
-        env:
-          # v43: set once via this repo's own Settings -> Secrets and
-          # variables -> Actions -> "New repository secret" (name must be
-          # exactly MARKETSTACK_API_KEY) — your real key from marketstack.com's
-          # dashboard. Never committed to this file or anywhere else in the
-          # repo. Without it, update_market_data.py exits immediately
-          # without touching market_data.json (see its own docstring).
-          MARKETSTACK_API_KEY: ${{ secrets.MARKETSTACK_API_KEY }}
-          # v44: only set when you fill in "backfill_days" running this by
-          # hand from the Actions tab — blank on every normal scheduled run,
-          # which is exactly what leaves the script's own default (7 days)
-          # in place. See update_market_data.py's own BACKFILL_DAYS comment.
-          BACKFILL_DAYS: ${{ github.event.inputs.backfill_days }}
 
       - name: Commit updated market_data.json
         run: |
